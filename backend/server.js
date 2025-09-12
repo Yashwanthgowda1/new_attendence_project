@@ -4,11 +4,17 @@ const cors = require('cors');
 const path = require('path');
 
 const app = express();
-const PORT = 3001;
+const PORT = process.env.PORT || 3001;
+const isDevelopment = process.env.NODE_ENV !== 'production';
 
 // Middleware
 app.use(cors());
 app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+
+// Serve static files from React build (ALWAYS serve static files)
+const frontendPath = path.join(__dirname, '../attendance-tracker/dist');
+app.use(express.static(frontendPath));
 
 // Database setup
 const dbPath = path.join(__dirname, 'attendance.db');
@@ -51,24 +57,20 @@ function initializeDatabase_table() {
     if (err) console.error('Error creating attendance_records table:', err);
   });
 
-  // Create index for better performance
-  db.run(`
-    CREATE INDEX IF NOT EXISTS idx_attendance_emp_date 
-    ON attendance_records(emp_id, date)
-  `);
-
-  db.run(`
-    CREATE INDEX IF NOT EXISTS idx_attendance_date 
-    ON attendance_records(date)
-  `);
+  // Create indexes for better performance
+  db.run(`CREATE INDEX IF NOT EXISTS idx_attendance_emp_date ON attendance_records(emp_id, date)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_attendance_date ON attendance_records(date)`);
 }
 
-// Routes
+// ===================
+// API Routes
+// ===================
 
 // Get all employees
 app.get('/api/employees', (req, res) => {
   db.all('SELECT * FROM employees ORDER BY name', [], (err, rows) => {
     if (err) {
+      console.error('Error fetching employees:', err);
       res.status(500).json({ error: err.message });
       return;
     }
@@ -89,6 +91,7 @@ app.post('/api/employees', (req, res) => {
     VALUES (?, ?, CURRENT_TIMESTAMP)
   `, [emp_id, name], function(err) {
     if (err) {
+      console.error('Error saving employee:', err);
       res.status(500).json({ error: err.message });
       return;
     }
@@ -113,6 +116,7 @@ app.post('/api/attendance', (req, res) => {
     VALUES (?, ?, CURRENT_TIMESTAMP)
   `, [emp_id, emp_name], function(err) {
     if (err) {
+      console.error('Error creating/updating employee:', err);
       res.status(500).json({ error: err.message });
       return;
     }
@@ -124,6 +128,7 @@ app.post('/api/attendance', (req, res) => {
       VALUES (?, ?, ?, ?)
     `, [emp_id, emp_name, attendance_type, date], function(err) {
       if (err) {
+        console.error('Error saving attendance:', err);
         res.status(500).json({ error: err.message });
         return;
       }
@@ -145,6 +150,7 @@ app.get('/api/attendance/:emp_id', (req, res) => {
     ORDER BY date DESC
   `, [emp_id], (err, rows) => {
     if (err) {
+      console.error('Error fetching employee attendance:', err);
       res.status(500).json({ error: err.message });
       return;
     }
@@ -152,7 +158,7 @@ app.get('/api/attendance/:emp_id', (req, res) => {
   });
 });
 
-// Get all attendance records
+// Get all attendance records with filters
 app.get('/api/attendance', (req, res) => {
   const { start_date, end_date, attendance_type } = req.query;
   
@@ -178,6 +184,7 @@ app.get('/api/attendance', (req, res) => {
 
   db.all(query, params, (err, rows) => {
     if (err) {
+      console.error('Error fetching attendance records:', err);
       res.status(500).json({ error: err.message });
       return;
     }
@@ -208,12 +215,12 @@ app.get('/api/stats', (req, res) => {
     db.all(query, [], (err, rows) => {
       if (err) {
         console.error(`Error in ${key} query:`, err);
-        stats[key] = 0;
+        stats[key] = key === 'attendanceByType' ? [] : 0;
       } else {
         if (key === 'attendanceByType') {
           stats[key] = rows;
         } else {
-          stats[key] = rows[0].count;
+          stats[key] = rows[0]?.count || 0;
         }
       }
       
@@ -231,6 +238,7 @@ app.delete('/api/attendance/:id', (req, res) => {
   
   db.run('DELETE FROM attendance_records WHERE id = ?', [id], function(err) {
     if (err) {
+      console.error('Error deleting attendance record:', err);
       res.status(500).json({ error: err.message });
       return;
     }
@@ -252,6 +260,7 @@ app.get('/api/attendance-range/:emp_id/:start_date/:end_date', (req, res) => {
     ORDER BY date DESC
   `, [emp_id, start_date, end_date], (err, rows) => {
     if (err) {
+      console.error('Error fetching attendance range:', err);
       res.status(500).json({ error: err.message });
       return;
     }
@@ -259,9 +268,54 @@ app.get('/api/attendance-range/:emp_id/:start_date/:end_date', (req, res) => {
   });
 });
 
-// Graceful shutdown
+// ===================
+// Frontend Routes (Must be LAST)
+// ===================
+
+// Health check endpoint
+app.get('/health', (req, res) => {
+  res.json({ 
+    status: 'OK', 
+    timestamp: new Date().toISOString(),
+    environment: isDevelopment ? 'development' : 'production'
+  });
+});
+
+// Serve React app for ALL other routes (catch-all route)
+app.get('*', (req, res) => {
+  const indexPath = path.join(frontendPath, 'index.html');
+  
+  // Check if index.html exists
+  if (require('fs').existsSync(indexPath)) {
+    res.sendFile(indexPath);
+  } else {
+    res.status(404).json({ 
+      error: 'Frontend not built. Please run: npm run build' 
+    });
+  }
+});
+
+// ===================
+// Error Handling
+// ===================
+
+// Global error handler
+app.use((err, req, res, next) => {
+  console.error('Unhandled error:', err);
+  res.status(500).json({ error: 'Internal server error' });
+});
+
+// Handle 404 for API routes specifically
+app.use('/api/*', (req, res) => {
+  res.status(404).json({ error: 'API endpoint not found' });
+});
+
+// ===================
+// Graceful Shutdown
+// ===================
+
 process.on('SIGINT', () => {
-  console.log('\nShutting down server...');
+  console.log('\nShutting down server gracefully...');
   db.close((err) => {
     if (err) {
       console.error('Error closing database:', err.message);
@@ -272,8 +326,29 @@ process.on('SIGINT', () => {
   });
 });
 
-// Start server
-app.listen(PORT, () => {
-  console.log(`Server running on http://localhost:${PORT}`);
-  console.log(`Database location: ${dbPath}`);
+process.on('SIGTERM', () => {
+  console.log('SIGTERM received, shutting down gracefully...');
+  db.close(() => {
+    process.exit(0);
+  });
+});
+
+// ===================
+// Start Server
+// ===================
+
+app.listen(PORT, '0.0.0.0', () => {
+  console.log('🚀 ==========================================');
+  console.log(`📱 Server running on http://localhost:${PORT}`);
+  console.log(`🌐 External access: http://0.0.0.0:${PORT}`);
+  console.log(`💾 Database: ${dbPath}`);
+  console.log(`📁 Frontend: ${frontendPath}`);
+  console.log(`🔧 Environment: ${isDevelopment ? 'Development' : 'Production'}`);
+  console.log('🚀 ==========================================');
+  
+  // Check if frontend build exists
+  if (!require('fs').existsSync(path.join(frontendPath, 'index.html'))) {
+    console.log('⚠️  WARNING: Frontend build not found!');
+    console.log('   Please run: npm run build');
+  }
 });
