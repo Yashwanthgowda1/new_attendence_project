@@ -1,19 +1,33 @@
 {
-  "name": "attandence_tracker",
+  "name": "attendance-tracker-fullstack",
   "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
+  "description": "Full-stack attendance tracker - Single server deployment",
+  "main": "backend/server.js",
   "scripts": {
-    "start": "node index.js",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start": "npm run build && cd backend && node server.js",
+    "dev": "concurrently \"npm run backend:dev\" \"npm run frontend:dev\"",
+    "build": "cd attendance-tracker && npm run build",
+    "build:production": "cd attendance-tracker && npm run build && echo 'Frontend built successfully!'",
+    "install:all": "npm install && cd attendance-tracker && npm install && cd ../backend && npm install",
+    "backend:dev": "cd backend && npm run dev",
+    "frontend:dev": "cd attendance-tracker && npm run dev",
+    "backend:start": "cd backend && node server.js",
+    "deploy": "npm run install:all && npm run build:production && npm run backend:start",
+    "ec2:start": "NODE_ENV=production npm run backend:start",
+    "logs": "cd backend && npm start"
   },
-  "keywords": [],
+  "keywords": [
+    "attendance",
+    "react",
+    "express",
+    "sqlite3",
+    "fullstack",
+    "ec2",
+    "single-server"
+  ],
   "author": "",
   "license": "ISC",
-  "type": "commonjs",
-  "dependencies": {
-    "cors": "^2.8.5",
-    "express": "^5.1.0",
-    "sqlite3": "^5.1.7"
+  "devDependencies": {
+    "concurrently": "^8.2.2"
   }
 }
