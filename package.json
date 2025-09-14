@@ -28,6 +28,10 @@
   "author": "",
   "license": "ISC",
   "devDependencies": {
+    "@types/pg": "^8.15.5",
     "concurrently": "^8.2.2"
+  },
+  "dependencies": {
+    "pg": "^8.16.3"
   }
 }
