@@ -1,11 +1,17 @@
+require('dotenv').config();
+
 const express = require('express');
-const sqlite3 = require('sqlite3').verbose();
+const { Pool } = require('pg');
 const cors = require('cors');
 const path = require('path');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
 const isDevelopment = process.env.NODE_ENV !== 'production';
+
+// Debug: Check if environment variables are loaded
+console.log('DATABASE_URL loaded:', process.env.DATABASE_URL ? 'YES' : 'NO');
+console.log('Environment:', process.env.NODE_ENV);
 
 // Middleware
 app.use(cors());
@@ -16,256 +22,281 @@ app.use(express.urlencoded({ extended: true }));
 const frontendPath = path.join(__dirname, '../attendance-tracker/dist');
 app.use(express.static(frontendPath));
 
-// Database setup
-const dbPath = path.join(__dirname, 'attendance.db');
-const db = new sqlite3.Database(dbPath, (err) => {
-  if (err) {
-    console.error('Error opening database:', err.message);
-  } else {
-    console.log('Connected to SQLite database');
-    initializeDatabase_table();
-  }
+// PostgreSQL Database setup
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : { rejectUnauthorized: false }
+});
+
+// Test database connection
+pool.on('connect', () => {
+  console.log('Connected to PostgreSQL database');
+});
+
+pool.on('error', (err) => {
+  console.error('Unexpected error on idle client', err);
+  process.exit(-1);
 });
 
 // Initialize database tables
-function initializeDatabase_table() {
-  // Create employees table
-  db.run(`
-    CREATE TABLE IF NOT EXISTS employees (
-      emp_id TEXT PRIMARY KEY,
-      name TEXT NOT NULL,
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    )
-  `, (err) => {
-    if (err) console.error('Error creating employees table:', err);
-  });
+async function initializeDatabase_table() {
+  const client = await pool.connect();
+  
+  try {
+    // Create employees table
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS employees (
+        emp_id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+    console.log('Employees table created/verified');
 
-  // Create attendance_records table
-  db.run(`
-    CREATE TABLE IF NOT EXISTS attendance_records (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      emp_id TEXT NOT NULL,
-      emp_name TEXT NOT NULL,
-      attendance_type TEXT NOT NULL,
-      date DATE NOT NULL,
-      timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-      FOREIGN KEY (emp_id) REFERENCES employees (emp_id),
-      UNIQUE(emp_id, date)
-    )
-  `, (err) => {
-    if (err) console.error('Error creating attendance_records table:', err);
-  });
+    // Create attendance_records table
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS attendance_records (
+        id SERIAL PRIMARY KEY,
+        emp_id TEXT NOT NULL,
+        emp_name TEXT NOT NULL,
+        attendance_type TEXT NOT NULL,
+        date DATE NOT NULL,
+        timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (emp_id) REFERENCES employees (emp_id),
+        UNIQUE(emp_id, date)
+      )
+    `);
+    console.log('Attendance_records table created/verified');
 
-  // Create indexes for better performance
-  db.run(`CREATE INDEX IF NOT EXISTS idx_attendance_emp_date ON attendance_records(emp_id, date)`);
-  db.run(`CREATE INDEX IF NOT EXISTS idx_attendance_date ON attendance_records(date)`);
+    // Create indexes for better performance
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_attendance_emp_date ON attendance_records(emp_id, date)`);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_attendance_date ON attendance_records(date)`);
+    console.log('Database indexes created/verified');
+    
+  } catch (err) {
+    console.error('Error initializing database:', err);
+  } finally {
+    client.release();
+  }
 }
+
+// Initialize database on startup
+initializeDatabase_table().catch(console.error);
 
 // ===================
 // API Routes
 // ===================
 
 // Get all employees
-app.get('/api/employees', (req, res) => {
-  db.all('SELECT * FROM employees ORDER BY name', [], (err, rows) => {
-    if (err) {
-      console.error('Error fetching employees:', err);
-      res.status(500).json({ error: err.message });
-      return;
-    }
-    res.json(rows);
-  });
+app.get('/api/employees', async (req, res) => {
+  try {
+    const result = await pool.query('SELECT * FROM employees ORDER BY name');
+    res.json(result.rows);
+  } catch (err) {
+    console.error('Error fetching employees:', err);
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // Add or update employee
-app.post('/api/employees', (req, res) => {
+app.post('/api/employees', async (req, res) => {
   const { emp_id, name } = req.body;
   
   if (!emp_id || !name) {
     return res.status(400).json({ error: 'Employee ID and name are required' });
   }
 
-  db.run(`
-    INSERT OR REPLACE INTO employees (emp_id, name, updated_at) 
-    VALUES (?, ?, CURRENT_TIMESTAMP)
-  `, [emp_id, name], function(err) {
-    if (err) {
-      console.error('Error saving employee:', err);
-      res.status(500).json({ error: err.message });
-      return;
-    }
+  try {
+    await pool.query(`
+      INSERT INTO employees (emp_id, name, updated_at) 
+      VALUES ($1, $2, CURRENT_TIMESTAMP)
+      ON CONFLICT (emp_id) 
+      DO UPDATE SET name = $2, updated_at = CURRENT_TIMESTAMP
+    `, [emp_id, name]);
+    
     res.json({ 
       message: 'Employee saved successfully',
       emp_id: emp_id
     });
-  });
+  } catch (err) {
+    console.error('Error saving employee:', err);
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // Add attendance record
-app.post('/api/attendance', (req, res) => {
+app.post('/api/attendance', async (req, res) => {
   const { emp_id, emp_name, attendance_type, date } = req.body;
   
   if (!emp_id || !emp_name || !attendance_type || !date) {
     return res.status(400).json({ error: 'All fields are required' });
   }
 
-  // First, ensure employee exists
-  db.run(`
-    INSERT OR REPLACE INTO employees (emp_id, name, updated_at) 
-    VALUES (?, ?, CURRENT_TIMESTAMP)
-  `, [emp_id, emp_name], function(err) {
-    if (err) {
-      console.error('Error creating/updating employee:', err);
-      res.status(500).json({ error: err.message });
-      return;
-    }
+  const client = await pool.connect();
+  
+  try {
+    await client.query('BEGIN');
+    
+    // First, ensure employee exists
+    await client.query(`
+      INSERT INTO employees (emp_id, name, updated_at) 
+      VALUES ($1, $2, CURRENT_TIMESTAMP)
+      ON CONFLICT (emp_id) 
+      DO UPDATE SET name = $2, updated_at = CURRENT_TIMESTAMP
+    `, [emp_id, emp_name]);
 
     // Then add attendance record
-    db.run(`
-      INSERT OR REPLACE INTO attendance_records 
+    const result = await client.query(`
+      INSERT INTO attendance_records 
       (emp_id, emp_name, attendance_type, date) 
-      VALUES (?, ?, ?, ?)
-    `, [emp_id, emp_name, attendance_type, date], function(err) {
-      if (err) {
-        console.error('Error saving attendance:', err);
-        res.status(500).json({ error: err.message });
-        return;
-      }
-      res.json({ 
-        message: 'Attendance record added successfully',
-        id: this.lastID
-      });
+      VALUES ($1, $2, $3, $4)
+      ON CONFLICT (emp_id, date) 
+      DO UPDATE SET emp_name = $2, attendance_type = $3, timestamp = CURRENT_TIMESTAMP
+      RETURNING id
+    `, [emp_id, emp_name, attendance_type, date]);
+
+    await client.query('COMMIT');
+    
+    res.json({ 
+      message: 'Attendance record added successfully',
+      id: result.rows[0].id
     });
-  });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error('Error saving attendance:', err);
+    res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
+  }
 });
 
 // Get attendance records by employee ID
-app.get('/api/attendance/:emp_id', (req, res) => {
+app.get('/api/attendance/:emp_id', async (req, res) => {
   const { emp_id } = req.params;
   
-  db.all(`
-    SELECT * FROM attendance_records 
-    WHERE emp_id = ? 
-    ORDER BY date DESC
-  `, [emp_id], (err, rows) => {
-    if (err) {
-      console.error('Error fetching employee attendance:', err);
-      res.status(500).json({ error: err.message });
-      return;
-    }
-    res.json(rows);
-  });
+  try {
+    const result = await pool.query(`
+      SELECT * FROM attendance_records 
+      WHERE emp_id = $1 
+      ORDER BY date DESC
+    `, [emp_id]);
+    
+    res.json(result.rows);
+  } catch (err) {
+    console.error('Error fetching employee attendance:', err);
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // Get all attendance records with filters
-app.get('/api/attendance', (req, res) => {
+app.get('/api/attendance', async (req, res) => {
   const { start_date, end_date, attendance_type } = req.query;
   
   let query = 'SELECT * FROM attendance_records WHERE 1=1';
   let params = [];
+  let paramCount = 0;
 
   if (start_date) {
-    query += ' AND date >= ?';
+    paramCount++;
+    query += ` AND date >= $${paramCount}`;
     params.push(start_date);
   }
 
   if (end_date) {
-    query += ' AND date <= ?';
+    paramCount++;
+    query += ` AND date <= $${paramCount}`;
     params.push(end_date);
   }
 
   if (attendance_type) {
-    query += ' AND attendance_type = ?';
+    paramCount++;
+    query += ` AND attendance_type = $${paramCount}`;
     params.push(attendance_type);
   }
 
   query += ' ORDER BY date DESC, emp_id';
 
-  db.all(query, params, (err, rows) => {
-    if (err) {
-      console.error('Error fetching attendance records:', err);
-      res.status(500).json({ error: err.message });
-      return;
-    }
-    res.json(rows);
-  });
+  try {
+    const result = await pool.query(query, params);
+    res.json(result.rows);
+  } catch (err) {
+    console.error('Error fetching attendance records:', err);
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // Get attendance statistics
-app.get('/api/stats', (req, res) => {
-  const queries = {
-    totalEmployees: 'SELECT COUNT(*) as count FROM employees',
-    totalRecords: 'SELECT COUNT(*) as count FROM attendance_records',
-    wfoRecords: "SELECT COUNT(*) as count FROM attendance_records WHERE attendance_type = 'WFO'",
-    wfhRecords: "SELECT COUNT(*) as count FROM attendance_records WHERE attendance_type = 'WFH'",
-    attendanceByType: `
+app.get('/api/stats', async (req, res) => {
+  try {
+    const stats = {};
+    
+    // Total employees
+    const totalEmpResult = await pool.query('SELECT COUNT(*) as count FROM employees');
+    stats.totalEmployees = parseInt(totalEmpResult.rows[0].count);
+
+    // Total records
+    const totalRecordsResult = await pool.query('SELECT COUNT(*) as count FROM attendance_records');
+    stats.totalRecords = parseInt(totalRecordsResult.rows[0].count);
+
+    // WFO records
+    const wfoResult = await pool.query("SELECT COUNT(*) as count FROM attendance_records WHERE attendance_type = 'WFO'");
+    stats.wfoRecords = parseInt(wfoResult.rows[0].count);
+
+    // WFH records
+    const wfhResult = await pool.query("SELECT COUNT(*) as count FROM attendance_records WHERE attendance_type = 'WFH'");
+    stats.wfhRecords = parseInt(wfhResult.rows[0].count);
+
+    // Attendance by type
+    const attendanceByTypeResult = await pool.query(`
       SELECT attendance_type, COUNT(*) as count 
       FROM attendance_records 
       GROUP BY attendance_type 
       ORDER BY count DESC
-    `
-  };
+    `);
+    stats.attendanceByType = attendanceByTypeResult.rows;
 
-  const stats = {};
-  let completed = 0;
-  const totalQueries = Object.keys(queries).length;
-
-  Object.entries(queries).forEach(([key, query]) => {
-    db.all(query, [], (err, rows) => {
-      if (err) {
-        console.error(`Error in ${key} query:`, err);
-        stats[key] = key === 'attendanceByType' ? [] : 0;
-      } else {
-        if (key === 'attendanceByType') {
-          stats[key] = rows;
-        } else {
-          stats[key] = rows[0]?.count || 0;
-        }
-      }
-      
-      completed++;
-      if (completed === totalQueries) {
-        res.json(stats);
-      }
-    });
-  });
+    res.json(stats);
+  } catch (err) {
+    console.error('Error fetching stats:', err);
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // Delete attendance record
-app.delete('/api/attendance/:id', (req, res) => {
+app.delete('/api/attendance/:id', async (req, res) => {
   const { id } = req.params;
   
-  db.run('DELETE FROM attendance_records WHERE id = ?', [id], function(err) {
-    if (err) {
-      console.error('Error deleting attendance record:', err);
-      res.status(500).json({ error: err.message });
-      return;
-    }
-    if (this.changes === 0) {
+  try {
+    const result = await pool.query('DELETE FROM attendance_records WHERE id = $1', [id]);
+    
+    if (result.rowCount === 0) {
       res.status(404).json({ error: 'Record not found' });
     } else {
       res.json({ message: 'Record deleted successfully' });
     }
-  });
+  } catch (err) {
+    console.error('Error deleting attendance record:', err);
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // Get attendance for a specific date range
-app.get('/api/attendance-range/:emp_id/:start_date/:end_date', (req, res) => {
+app.get('/api/attendance-range/:emp_id/:start_date/:end_date', async (req, res) => {
   const { emp_id, start_date, end_date } = req.params;
   
-  db.all(`
-    SELECT * FROM attendance_records 
-    WHERE emp_id = ? AND date BETWEEN ? AND ? 
-    ORDER BY date DESC
-  `, [emp_id, start_date, end_date], (err, rows) => {
-    if (err) {
-      console.error('Error fetching attendance range:', err);
-      res.status(500).json({ error: err.message });
-      return;
-    }
-    res.json(rows);
-  });
+  try {
+    const result = await pool.query(`
+      SELECT * FROM attendance_records 
+      WHERE emp_id = $1 AND date BETWEEN $2 AND $3 
+      ORDER BY date DESC
+    `, [emp_id, start_date, end_date]);
+    
+    res.json(result.rows);
+  } catch (err) {
+    console.error('Error fetching attendance range:', err);
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // ===================
@@ -273,12 +304,24 @@ app.get('/api/attendance-range/:emp_id/:start_date/:end_date', (req, res) => {
 // ===================
 
 // Health check endpoint
-app.get('/health', (req, res) => {
-  res.json({ 
-    status: 'OK', 
-    timestamp: new Date().toISOString(),
-    environment: isDevelopment ? 'development' : 'production'
-  });
+app.get('/health', async (req, res) => {
+  try {
+    // Test database connection
+    await pool.query('SELECT NOW()');
+    res.json({ 
+      status: 'OK', 
+      timestamp: new Date().toISOString(),
+      environment: isDevelopment ? 'development' : 'production',
+      database: 'Connected'
+    });
+  } catch (err) {
+    res.status(500).json({
+      status: 'ERROR',
+      timestamp: new Date().toISOString(),
+      database: 'Disconnected',
+      error: err.message
+    });
+  }
 });
 
 // Serve React app for ALL other routes (catch-all route)
@@ -314,23 +357,25 @@ app.use('/api/*', (req, res) => {
 // Graceful Shutdown
 // ===================
 
-process.on('SIGINT', () => {
+process.on('SIGINT', async () => {
   console.log('\nShutting down server gracefully...');
-  db.close((err) => {
-    if (err) {
-      console.error('Error closing database:', err.message);
-    } else {
-      console.log('Database connection closed');
-    }
-    process.exit(0);
-  });
+  try {
+    await pool.end();
+    console.log('Database connection pool closed');
+  } catch (err) {
+    console.error('Error closing database pool:', err.message);
+  }
+  process.exit(0);
 });
 
-process.on('SIGTERM', () => {
+process.on('SIGTERM', async () => {
   console.log('SIGTERM received, shutting down gracefully...');
-  db.close(() => {
-    process.exit(0);
-  });
+  try {
+    await pool.end();
+  } catch (err) {
+    console.error('Error closing database pool:', err.message);
+  }
+  process.exit(0);
 });
 
 // ===================
@@ -341,7 +386,7 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log('🚀 ==========================================');
   console.log(`📱 Server running on http://localhost:${PORT}`);
   console.log(`🌐 External access: http://0.0.0.0:${PORT}`);
-  console.log(`💾 Database: ${dbPath}`);
+  console.log(`🗄️  Database: PostgreSQL`);
   console.log(`📁 Frontend: ${frontendPath}`);
   console.log(`🔧 Environment: ${isDevelopment ? 'Development' : 'Production'}`);
   console.log('🚀 ==========================================');
